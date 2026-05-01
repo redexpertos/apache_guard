@@ -10,12 +10,6 @@ Arquitectura:
 - Decisión basada en comportamiento (4xx + error_log)
 - Integración con CSF
 - Persistencia de estado en SQLite
-
-Extensión implementada:
-- Enriquecimiento de eventos access_log con user-agent
-- Clasificación simple de user-agent
-- Agregación contextual por user-agent y familia
-- Logging de contexto sin modificar reglas de bloqueo
 """
 
 from __future__ import print_function
@@ -51,7 +45,12 @@ THRESHOLD_DISTINCT_DOMAINS = 6
 THRESHOLD_SAME_RESOURCE_HITS = 30
 THRESHOLD_KNOWN_MALICIOUS = 5
 THRESHOLD_SUSPICIOUS_RESOURCES = 15
-TOP_USER_AGENTS_TO_LOG = 3
+
+# Señales de scraping masivo: solo observación, no bloqueo directo
+SCRAPING_TOTAL_REQUESTS = 100
+SCRAPING_DISTINCT_ROUTES = 20
+SCRAPING_SAME_RESOURCE_HITS = 30
+SCRAPING_MIN_SCORE = 2
 
 WHITELIST_IPS = {
     "127.0.0.1",
@@ -333,20 +332,18 @@ def classify_uri(uri, exact_matches, known_patterns, suspicious_patterns):
 
     return "normal"
 
-# =========================
-# CLASIFICACIÓN DE USER-AGENT
-# =========================
 
 def classify_user_agent(user_agent):
     if not user_agent:
         return "anomalous"
 
-    ua = user_agent.strip().lower()
+    ua_raw = user_agent.strip()
+    ua = ua_raw.lower()
 
     if not ua:
         return "anomalous"
 
-    if len(ua) < 8:
+    if len(ua) < 4:
         return "anomalous"
 
     if ua.isdigit():
@@ -389,15 +386,8 @@ def classify_user_agent(user_agent):
         if marker in ua:
             return "known_bot"
 
-    generic_bot_markers = [
-        "bot",
-        "crawler",
-        "spider",
-    ]
-
-    for marker in generic_bot_markers:
-        if marker in ua:
-            return "generic_bot"
+    if "bot" in ua or "crawler" in ua or "spider" in ua:
+        return "generic_bot"
 
     if "mozilla" in ua:
         return "browser"
@@ -415,6 +405,7 @@ def parse_access_line(line, domain, exact_matches, known_patterns, suspicious_pa
 
     uri = m.group("uri")
     uri_class = classify_uri(uri, exact_matches, known_patterns, suspicious_patterns)
+
     user_agent = m.group("user_agent") or ""
     user_agent_family = classify_user_agent(user_agent)
 
@@ -600,15 +591,17 @@ def aggregate(events):
             group = str(code)[0] + "xx"
             route = e["method"] + " " + e["uri"]
             domain = e.get("domain") or "unknown"
-            user_agent = e.get("user_agent") or "unknown"
-            user_agent_family = e.get("user_agent_family") or "anomalous"
 
             stats[ip]["total"] += 1
             stats[ip][group] += 1
             stats[ip]["routes"][route] += 1
             stats[ip]["domains"][domain] += 1
             stats[ip]["uri_classes"][uri_class] += 1
-            stats[ip]["user_agents"][user_agent] += 1
+
+            user_agent = e.get("user_agent") or ""
+            user_agent_key = user_agent if user_agent else "unknown"
+            user_agent_family = e.get("user_agent_family") or "anomalous"
+            stats[ip]["user_agents"][user_agent_key] += 1
             stats[ip]["user_agent_families"][user_agent_family] += 1
 
             if uri_class == "known_malicious":
@@ -617,6 +610,47 @@ def aggregate(events):
                 stats[ip]["suspicious"] += 1
 
     return stats
+
+# =========================
+# DETECCIÓN DE SCRAPING MASIVO
+# =========================
+
+def detect_scraping_signal(stats_ip):
+    """
+    Calcula señales simples de scraping masivo por IP.
+
+    Esta función NO decide bloqueo, NO invoca CSF y NO modifica reglas existentes.
+    Solo expone contexto operativo para observación y decisiones futuras.
+    """
+    total = stats_ip["total"]
+    distinct_routes = len(stats_ip["routes"])
+    top_route_hits = stats_ip["routes"].most_common(1)[0][1] if stats_ip["routes"] else 0
+
+    high_volume = total >= SCRAPING_TOTAL_REQUESTS
+    high_variation = distinct_routes >= SCRAPING_DISTINCT_ROUTES
+    concentrated_hits = top_route_hits >= SCRAPING_SAME_RESOURCE_HITS
+
+    scraping_score = 0
+
+    if high_volume:
+        scraping_score += 1
+
+    if high_variation:
+        scraping_score += 1
+
+    if concentrated_hits:
+        scraping_score += 1
+
+    return {
+        "is_scraping_suspected": scraping_score >= SCRAPING_MIN_SCORE,
+        "scraping_score": scraping_score,
+        "high_volume": high_volume,
+        "high_variation": high_variation,
+        "concentrated_hits": concentrated_hits,
+        "top_route_hits": top_route_hits,
+        "distinct_routes": distinct_routes,
+        "total_requests": total,
+    }
 
 # =========================
 # CSF
@@ -687,6 +721,7 @@ def main():
 
     for ip in top_ips:
         s = stats[ip]
+        scraping = detect_scraping_signal(s)
 
         if is_whitelisted_ip(ip):
             logger.info("WHITELIST %s", ip)
@@ -705,13 +740,13 @@ def main():
         max_same_resource_hits = top_route_items[0][1] if top_route_items else 0
         top_error_routes = " | ".join(["{} {}".format(c, r) for r, c in s["error_routes"].most_common(TOP_ROUTES_TO_LOG)])
         top_modsec = " | ".join(["{} {}".format(c, r) for r, c in s["modsec_rule_ids"].most_common(3)])
-        top_user_agent_families = " | ".join(["{} {}".format(c, f) for f, c in s["user_agent_families"].most_common(TOP_USER_AGENTS_TO_LOG)])
-        top_user_agents = " | ".join(["{} {}".format(c, ua[:120]) for ua, c in s["user_agents"].most_common(TOP_USER_AGENTS_TO_LOG)])
+        top_user_agent_families = " | ".join(["{} {}".format(c, f) for f, c in s["user_agent_families"].most_common(3)])
+        top_user_agents = " | ".join(["{} {}".format(c, ua) for ua, c in s["user_agents"].most_common(3)])
         distinct_user_agent_families = len(s["user_agent_families"])
         dominant_user_agent = s["user_agents"].most_common(1)[0][0] if s["user_agents"] else "unknown"
 
         logger.info(
-            "Analizando %s dominios_total=%s 2xx=%s 3xx=%s 4xx=%s 5xx=%s conocidos=%s sospechosos=%s authz=%s modsec=%s autoindex=%s sensitive=%s max_recurso=%s top_dominios=%s top_error_dominios=%s top_rutas=%s top_error=%s top_modsec=%s top_user_agent_families=%s top_user_agents=%s distinct_user_agent_families=%s dominant_user_agent=%s",
+            "Analizando %s dominios_total=%s 2xx=%s 3xx=%s 4xx=%s 5xx=%s conocidos=%s sospechosos=%s authz=%s modsec=%s autoindex=%s sensitive=%s max_recurso=%s top_dominios=%s top_error_dominios=%s top_rutas=%s top_error=%s top_modsec=%s top_user_agent_families=%s top_user_agents=%s distinct_user_agent_families=%s dominant_user_agent=%s scraping_score=%s scraping=%s high_vol=%s high_var=%s conc_hits=%s distinct_routes=%s scraping_top_route_hits=%s",
             ip,
             distinct_domains_total,
             s["2xx"],
@@ -733,7 +768,14 @@ def main():
             top_user_agent_families,
             top_user_agents,
             distinct_user_agent_families,
-            dominant_user_agent[:120],
+            dominant_user_agent,
+            scraping["scraping_score"],
+            scraping["is_scraping_suspected"],
+            scraping["high_volume"],
+            scraping["high_variation"],
+            scraping["concentrated_hits"],
+            scraping["distinct_routes"],
+            scraping["top_route_hits"],
         )
 
         should_block = False

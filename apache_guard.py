@@ -40,9 +40,9 @@ THRESHOLD_4XX = 20
 THRESHOLD_AUTHZ_DENIED = 5
 THRESHOLD_MODSEC_ALERT = 10
 BLOCK_DURATION_SECONDS = 3600
-RATE_LIMIT_DURATION_LOW = 120
-RATE_LIMIT_DURATION_MEDIUM = 300
-RATE_LIMIT_DURATION_HIGH = 600
+RATE_LIMIT_DURATION_LOW = 300
+RATE_LIMIT_DURATION_MEDIUM = 1800
+RATE_LIMIT_DURATION_HIGH = 3600
 TOP_ROUTES_TO_LOG = 3
 THRESHOLD_DISTINCT_DOMAINS = 6
 THRESHOLD_SAME_RESOURCE_HITS = 30
@@ -724,10 +724,87 @@ def evaluate_declared_bot_policy(stats_ip, scraping):
 
 
 # =========================
+# DECISION CONTROLADA POR SCRAPING
+# =========================
+
+def has_error_or_abuse_context(stats_ip):
+    """
+    Determina si el scraping tipo browser tiene contexto adicional de abuso.
+
+    Esta funcion evita bloquear trafico de alto volumen con user-agent de navegador
+    si no existen errores o senales ya observadas por el modelo actual.
+    """
+    return (
+        stats_ip["4xx"] > 0 or
+        stats_ip["authz_denied_count"] > 0 or
+        stats_ip["modsec_alert_count"] > 0 or
+        stats_ip["known_malicious"] > 0 or
+        stats_ip["suspicious"] > 0 or
+        stats_ip["sensitive_denied_count"] > 0
+    )
+
+
+def evaluate_scraping_block_decision(stats_ip, scraping, declared_bot):
+    """
+    Evalua si la senal de scraping debe activar una respuesta temporal con CSF.
+
+    Restricciones aplicadas:
+    - No bloquea por volumen solamente.
+    - No bloquea bots conocidos declarados sin validacion DNS.
+    - No reemplaza reglas existentes; solo se usa cuando should_block sigue en False.
+    - Exige automatizacion sospechosa, alta confianza o browser scraping con errores.
+    """
+    if not scraping.get("is_scraping_suspected"):
+        return {
+            "should_block": False,
+            "block_reason": None,
+        }
+
+    policy = declared_bot.get("declared_bot_policy")
+
+    if policy == "declared_known_bot":
+        return {
+            "should_block": False,
+            "block_reason": None,
+        }
+
+    scraping_score = scraping.get("scraping_score", 0)
+    top_route_hits = scraping.get("top_route_hits", 0)
+    distinct_routes = scraping.get("distinct_routes", 0)
+
+    if policy == "suspicious_automation":
+        return {
+            "should_block": True,
+            "block_reason": "scraping_suspicious_automation",
+        }
+
+    if (
+        scraping_score >= 3 or
+        top_route_hits >= SCRAPING_SAME_RESOURCE_HITS or
+        distinct_routes >= SCRAPING_DISTINCT_ROUTES
+    ):
+        return {
+            "should_block": True,
+            "block_reason": "scraping_high_confidence",
+        }
+
+    if policy == "browser_scraping" and has_error_or_abuse_context(stats_ip):
+        return {
+            "should_block": True,
+            "block_reason": "browser_scraping_with_error_context",
+        }
+
+    return {
+        "should_block": False,
+        "block_reason": None,
+    }
+
+
+# =========================
 # RATE LIMITING PROGRESIVO
 # =========================
 
-def calculate_response_severity(stats_ip, scraping):
+def calculate_response_severity(stats_ip, scraping, block_reason=None):
     """
     Calcula severidad operativa para ajustar la duración de csf -td.
 
@@ -736,6 +813,13 @@ def calculate_response_severity(stats_ip, scraping):
     """
     severity_score = 0
     severity_reasons = []
+
+    if block_reason and block_reason.startswith("scraping_"):
+        severity_reasons.append(block_reason)
+        if block_reason in ("scraping_suspicious_automation", "scraping_high_confidence"):
+            severity_score += 2
+        elif block_reason == "browser_scraping_with_error_context":
+            severity_score += 1
 
     if stats_ip["4xx"] > THRESHOLD_4XX:
         severity_score += 1
@@ -950,18 +1034,29 @@ def main():
             should_block = True
             block_reason = "same_resource_hits>={}".format(THRESHOLD_SAME_RESOURCE_HITS)
 
+        if not should_block:
+            scraping_decision = evaluate_scraping_block_decision(s, scraping, declared_bot)
+            if scraping_decision["should_block"]:
+                should_block = True
+                block_reason = scraping_decision["block_reason"]
+
         if should_block:
-            response = calculate_response_severity(s, scraping)
+            response = calculate_response_severity(s, scraping, block_reason)
             logger.info(
-                "BLOQUEANDO %s motivo=%s severidad=%s duracion=%s severity_score=%s severity_reasons=%s dominios_total=%s max_recurso=%s top_dominios=%s top_error_dominios=%s rutas=%s error_rutas=%s modsec=%s",
+                "BLOQUEANDO %s motivo=%s severidad=%s duracion=%s severity_score=%s severity_reasons=%s scraping_score=%s declared_bot_policy=%s declared_bot_reason=%s dominios_total=%s max_recurso=%s scraping_top_route_hits=%s distinct_routes=%s top_dominios=%s top_error_dominios=%s rutas=%s error_rutas=%s modsec=%s",
                 ip,
                 block_reason,
                 response["severity"],
                 response["duration"],
                 response["severity_score"],
                 ",".join(response["severity_reasons"]),
+                scraping["scraping_score"],
+                declared_bot["declared_bot_policy"],
+                declared_bot["declared_bot_reason"],
                 distinct_domains_total,
                 max_same_resource_hits,
+                scraping["top_route_hits"],
+                scraping["distinct_routes"],
                 top_domains,
                 top_error_domains,
                 top_routes,

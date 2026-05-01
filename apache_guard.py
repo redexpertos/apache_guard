@@ -40,6 +40,9 @@ THRESHOLD_4XX = 20
 THRESHOLD_AUTHZ_DENIED = 5
 THRESHOLD_MODSEC_ALERT = 10
 BLOCK_DURATION_SECONDS = 3600
+RATE_LIMIT_DURATION_LOW = 300
+RATE_LIMIT_DURATION_MEDIUM = 1800
+RATE_LIMIT_DURATION_HIGH = 3600
 TOP_ROUTES_TO_LOG = 3
 THRESHOLD_DISTINCT_DOMAINS = 6
 THRESHOLD_SAME_RESOURCE_HITS = 30
@@ -718,6 +721,74 @@ def evaluate_declared_bot_policy(stats_ip, scraping):
     }
 
 
+
+
+# =========================
+# RATE LIMITING PROGRESIVO
+# =========================
+
+def calculate_response_severity(stats_ip, scraping):
+    """
+    Calcula severidad operativa para ajustar la duración de csf -td.
+
+    Esta función NO decide si se bloquea. Solo clasifica la severidad cuando
+    la lógica existente ya decidió aplicar respuesta con CSF.
+    """
+    severity_score = 0
+    severity_reasons = []
+
+    if stats_ip["4xx"] > THRESHOLD_4XX:
+        severity_score += 1
+        severity_reasons.append("4xx")
+
+    if stats_ip["known_malicious"] >= THRESHOLD_KNOWN_MALICIOUS:
+        severity_score += 2
+        severity_reasons.append("known_malicious")
+
+    if stats_ip["suspicious"] >= THRESHOLD_SUSPICIOUS_RESOURCES:
+        severity_score += 1
+        severity_reasons.append("suspicious")
+
+    if stats_ip["authz_denied_count"] >= THRESHOLD_AUTHZ_DENIED:
+        severity_score += 1
+        severity_reasons.append("authz_denied")
+
+    if stats_ip["modsec_alert_count"] >= THRESHOLD_MODSEC_ALERT:
+        severity_score += 2
+        severity_reasons.append("modsec_alert")
+
+    scraping_score = scraping.get("scraping_score", 0)
+    if scraping_score > 0:
+        severity_score += scraping_score
+        severity_reasons.append("scraping_score={}".format(scraping_score))
+
+    if stats_ip["sensitive_denied_count"] >= 1:
+        severity_score += 3
+        severity_reasons.append("sensitive_denied")
+
+    if severity_score >= 4:
+        return {
+            "severity": "alto",
+            "duration": RATE_LIMIT_DURATION_HIGH,
+            "severity_score": severity_score,
+            "severity_reasons": severity_reasons,
+        }
+
+    if severity_score >= 2:
+        return {
+            "severity": "medio",
+            "duration": RATE_LIMIT_DURATION_MEDIUM,
+            "severity_score": severity_score,
+            "severity_reasons": severity_reasons,
+        }
+
+    return {
+        "severity": "bajo",
+        "duration": RATE_LIMIT_DURATION_LOW,
+        "severity_score": severity_score,
+        "severity_reasons": severity_reasons,
+    }
+
 # =========================
 # CSF
 # =========================
@@ -728,8 +799,11 @@ def is_blocked(ip):
     return "DENY" in text
 
 
-def block_ip(ip, reason):
-    cmd = [CSF_BIN, "-td", ip, str(BLOCK_DURATION_SECONDS), reason]
+def block_ip(ip, reason, duration=None):
+    if duration is None:
+        duration = BLOCK_DURATION_SECONDS
+
+    cmd = [CSF_BIN, "-td", ip, str(duration), reason]
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
 # =========================
@@ -877,10 +951,15 @@ def main():
             block_reason = "same_resource_hits>={}".format(THRESHOLD_SAME_RESOURCE_HITS)
 
         if should_block:
+            response = calculate_response_severity(s, scraping)
             logger.info(
-                "BLOQUEANDO %s motivo=%s dominios_total=%s max_recurso=%s top_dominios=%s top_error_dominios=%s rutas=%s error_rutas=%s modsec=%s",
+                "BLOQUEANDO %s motivo=%s severidad=%s duracion=%s severity_score=%s severity_reasons=%s dominios_total=%s max_recurso=%s top_dominios=%s top_error_dominios=%s rutas=%s error_rutas=%s modsec=%s",
                 ip,
                 block_reason,
+                response["severity"],
+                response["duration"],
+                response["severity_score"],
+                ",".join(response["severity_reasons"]),
                 distinct_domains_total,
                 max_same_resource_hits,
                 top_domains,
@@ -889,7 +968,7 @@ def main():
                 top_error_routes,
                 top_modsec,
             )
-            block_ip(ip, block_reason)
+            block_ip(ip, block_reason, response["duration"])
 
     logger.info("Fin ejecución")
 

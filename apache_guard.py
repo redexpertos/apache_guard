@@ -652,6 +652,72 @@ def detect_scraping_signal(stats_ip):
         "total_requests": total,
     }
 
+
+
+# =========================
+# EVALUACIÓN DE BOT DECLARADO
+# =========================
+
+def evaluate_declared_bot_policy(stats_ip, scraping):
+    """
+    Evalúa el contexto del user-agent cuando existe señal de scraping.
+
+    Esta función NO valida legitimidad real del bot.
+    Sin reverse DNS / forward DNS solo podemos interpretar lo que el cliente declara
+    en el user-agent. Por eso la salida usa el término declared, no validated.
+    """
+    family_counts = stats_ip.get("user_agent_families", collections.Counter())
+    user_agent_counts = stats_ip.get("user_agents", collections.Counter())
+
+    dominant_family = family_counts.most_common(1)[0][0] if family_counts else "anomalous"
+    dominant_user_agent = user_agent_counts.most_common(1)[0][0] if user_agent_counts else "unknown"
+    distinct_families = len(family_counts)
+
+    if not scraping.get("is_scraping_suspected"):
+        return {
+            "declared_bot_policy": "not_applicable",
+            "declared_bot_reason": "no_scraping_signal",
+            "dominant_user_agent_family": dominant_family,
+            "dominant_user_agent": dominant_user_agent,
+            "distinct_user_agent_families": distinct_families,
+        }
+
+    if dominant_family == "known_bot":
+        return {
+            "declared_bot_policy": "declared_known_bot",
+            "declared_bot_reason": "scraping_with_known_bot_user_agent",
+            "dominant_user_agent_family": dominant_family,
+            "dominant_user_agent": dominant_user_agent,
+            "distinct_user_agent_families": distinct_families,
+        }
+
+    if dominant_family in ("generic_bot", "http_library", "anomalous"):
+        return {
+            "declared_bot_policy": "suspicious_automation",
+            "declared_bot_reason": "scraping_with_non_browser_automation",
+            "dominant_user_agent_family": dominant_family,
+            "dominant_user_agent": dominant_user_agent,
+            "distinct_user_agent_families": distinct_families,
+        }
+
+    if dominant_family == "browser":
+        return {
+            "declared_bot_policy": "browser_scraping",
+            "declared_bot_reason": "scraping_with_browser_user_agent",
+            "dominant_user_agent_family": dominant_family,
+            "dominant_user_agent": dominant_user_agent,
+            "distinct_user_agent_families": distinct_families,
+        }
+
+    return {
+        "declared_bot_policy": "unknown",
+        "declared_bot_reason": "unclassified_user_agent_context",
+        "dominant_user_agent_family": dominant_family,
+        "dominant_user_agent": dominant_user_agent,
+        "distinct_user_agent_families": distinct_families,
+    }
+
+
 # =========================
 # CSF
 # =========================
@@ -722,6 +788,7 @@ def main():
     for ip in top_ips:
         s = stats[ip]
         scraping = detect_scraping_signal(s)
+        declared_bot = evaluate_declared_bot_policy(s, scraping)
 
         if is_whitelisted_ip(ip):
             logger.info("WHITELIST %s", ip)
@@ -746,7 +813,7 @@ def main():
         dominant_user_agent = s["user_agents"].most_common(1)[0][0] if s["user_agents"] else "unknown"
 
         logger.info(
-            "Analizando %s dominios_total=%s 2xx=%s 3xx=%s 4xx=%s 5xx=%s conocidos=%s sospechosos=%s authz=%s modsec=%s autoindex=%s sensitive=%s max_recurso=%s top_dominios=%s top_error_dominios=%s top_rutas=%s top_error=%s top_modsec=%s top_user_agent_families=%s top_user_agents=%s distinct_user_agent_families=%s dominant_user_agent=%s scraping_score=%s scraping=%s high_vol=%s high_var=%s conc_hits=%s distinct_routes=%s scraping_top_route_hits=%s",
+            "Analizando %s dominios_total=%s 2xx=%s 3xx=%s 4xx=%s 5xx=%s conocidos=%s sospechosos=%s authz=%s modsec=%s autoindex=%s sensitive=%s max_recurso=%s top_dominios=%s top_error_dominios=%s top_rutas=%s top_error=%s top_modsec=%s top_user_agent_families=%s top_user_agents=%s distinct_user_agent_families=%s dominant_user_agent=%s scraping_score=%s scraping=%s high_vol=%s high_var=%s conc_hits=%s distinct_routes=%s scraping_top_route_hits=%s dominant_ua_family=%s declared_bot_policy=%s declared_bot_reason=%s",
             ip,
             distinct_domains_total,
             s["2xx"],
@@ -776,6 +843,9 @@ def main():
             scraping["concentrated_hits"],
             scraping["distinct_routes"],
             scraping["top_route_hits"],
+            declared_bot["dominant_user_agent_family"],
+            declared_bot["declared_bot_policy"],
+            declared_bot["declared_bot_reason"],
         )
 
         should_block = False
